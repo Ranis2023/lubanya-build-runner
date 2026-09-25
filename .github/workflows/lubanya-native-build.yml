@@ -1,0 +1,93 @@
+# §NATIVE_BUILD — сборочный рабочий Любани на GitHub Actions.
+# Скопируйте этот файл в свой репозиторий по пути:
+#   .github/workflows/lubanya-native-build.yml
+# Секретов в файле нет: каждое задание приносит одноразовый ключ.
+name: lubanya-native-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id: { description: "Задание", required: true }
+      snapshot_url: { description: "Снимок файлов", required: true }
+      callback_url: { description: "Адрес отчёта", required: true }
+      build_token: { description: "Одноразовый ключ", required: true }
+      public_base: { description: "Адрес статики", required: true }
+
+run-name: "lubanya build ${{ inputs.job_id }}"
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Скрыть ключ в журнале
+        run: echo "::add-mask::${{ inputs.build_token }}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Собрать проект как у автора
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          SNAPSHOT_URL: ${{ inputs.snapshot_url }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          BUILD_TOKEN: ${{ inputs.build_token }}
+          PUBLIC_BASE: ${{ inputs.public_base }}
+        run: |
+          cat > /tmp/runner.mjs <<'RUNNER'
+          import { execSync } from "node:child_process";
+          import fs from "node:fs";
+          import path from "node:path";
+          const { JOB_ID, SNAPSHOT_URL, CALLBACK_URL, BUILD_TOKEN, PUBLIC_BASE } = process.env;
+          const dir = "/tmp/app";
+          let log = "";
+          const run = (cmd) => { log += `\n$ ${cmd}\n`; try { log += execSync(cmd, { cwd: dir, stdio: "pipe", encoding: "utf8", env: { ...process.env, BUILD_TOKEN: "", CI: "true", NODE_OPTIONS: "--max-old-space-size=6144" } }); } catch (e) { log += (e.stdout || "") + (e.stderr || ""); throw e; } };
+          const call = async (body) => { const r = await fetch(CALLBACK_URL, { method: "POST", headers: { "Content-Type": "application/json", "x-build-token": BUILD_TOKEN }, body: JSON.stringify({ jobId: JOB_ID, ...body }) }); const t = await r.text(); if (!r.ok) throw new Error(`callback ${r.status}: ${t}`); return t; };
+          let pm = "npm";
+          try {
+            const snap = await (await fetch(SNAPSHOT_URL)).json();
+            for (const f of snap.files) {
+              const rel = f.path.replace(/^\/+/, "");
+              if (rel.split("/").includes("..")) continue;
+              const isB64 = rel.endsWith(".b64");
+              const out = path.join(dir, isB64 ? rel.slice(0, -4) : rel);
+              fs.mkdirSync(path.dirname(out), { recursive: true });
+              fs.writeFileSync(out, isB64 ? Buffer.from(f.content, "base64") : f.content);
+            }
+            const has = (n) => fs.existsSync(path.join(dir, n));
+            pm = has("bun.lock") || has("bun.lockb") ? "bun" : has("pnpm-lock.yaml") ? "pnpm" : has("yarn.lock") ? "yarn" : "npm";
+            if (pm === "bun") run("npm i -g bun@1 >/dev/null && bun install");
+            else if (pm === "pnpm") run("corepack enable && pnpm install --frozen-lockfile=false");
+            else if (pm === "yarn") run("corepack enable && yarn install");
+            else run(has("package-lock.json") ? "npm ci || npm install" : "npm install");
+            const pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8"));
+            if (!pkg.scripts?.build) throw new Error("В package.json нет scripts.build");
+            const runBuild = pm === "npm" ? "npm run build --" : `${pm} run build`;
+            run(`${runBuild} --base ${JSON.stringify(PUBLIC_BASE)}`);
+            const outDir = ["dist/client", "dist", "build", ".output/public", "out"].map((d) => path.join(dir, d)).find((d) => fs.existsSync(path.join(d, "index.html")));
+            if (!outDir) throw new Error("После сборки не найден index.html (dist, build, .output/public)");
+            const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".ico": "image/x-icon", ".woff": "font/woff", ".woff2": "font/woff2", ".txt": "text/plain", ".map": "application/json" };
+            const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]);
+            let batch = [], size = 0;
+            const flush = async () => { if (batch.length) { await call({ action: "upload", files: batch }); batch = []; size = 0; } };
+            for (const file of walk(outDir)) {
+              if (file.endsWith(".map")) continue;
+              const b64 = fs.readFileSync(file).toString("base64");
+              if (size + b64.length > 3_500_000) await flush();
+              batch.push({ path: path.relative(outDir, file), b64, contentType: types[path.extname(file).toLowerCase()] });
+              size += b64.length;
+            }
+            await flush();
+            await call({ action: "finish", ok: true, log: log.slice(-20000), packageManager: pm });
+            console.log("OK");
+          } catch (e) {
+            log += `\nERROR: ${e.message}`;
+            console.log(log.slice(-20000));
+            await call({ action: "finish", ok: false, log: log.slice(-20000), packageManager: pm }).catch(() => {});
+            process.exit(1);
+          }
+          RUNNER
+          node /tmp/runner.mjs
