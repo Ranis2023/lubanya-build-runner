@@ -22,8 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Скрыть ключ в журнале
-        run: echo "::add-mask::${{ inputs.build_token }}"
+      - name: Скрыть ключ и ссылки в журнале
+        env:
+          BUILD_TOKEN: ${{ inputs.build_token }}
+          SNAPSHOT_URL: ${{ inputs.snapshot_url }}
+        run: |
+          echo "::add-mask::$BUILD_TOKEN"
+          echo "::add-mask::$SNAPSHOT_URL"
 
       - uses: actions/setup-node@v4
         with:
